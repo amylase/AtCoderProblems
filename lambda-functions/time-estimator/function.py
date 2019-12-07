@@ -87,7 +87,8 @@ def inverse_adjust_rating(rating, prev_contests):
 
 
 def is_very_easy_problem(task_screen_name):
-    return task_screen_name.startswith("abc") and task_screen_name[-1] in {"a", "b"} and int(task_screen_name[3:6]) >= 42
+    return task_screen_name.startswith("abc") and task_screen_name[-1] in {"a", "b"} and int(
+        task_screen_name[3:6]) >= 42
 
 
 def fit_problem_model(user_results, task_screen_name):
@@ -97,16 +98,23 @@ def fit_problem_model(user_results, task_screen_name):
         return {}
     for task_result in user_results:
         task_result[task_screen_name + ".ac"] = float(task_result[task_screen_name + ".score"] == max_score)
-    elapsed = [task_result[task_screen_name + ".elapsed"]
-               for task_result in user_results]
-    first_ac = min(elapsed)
+    ac_elapsed = [task_result[task_screen_name + ".elapsed"]
+                  for task_result in user_results if task_result[task_screen_name + ".ac"] == 1.]
+    first_ac = min(ac_elapsed)
 
-    recurring_users = [task_result for task_result in user_results if task_result["prev_contests"] > 0 and task_result["rating"] > 0]
+    recurring_users = [task_result for task_result in user_results if
+                       task_result["prev_contests"] > 0 and task_result["rating"] > 0]
     for task_result in recurring_users:
         task_result["raw_rating"] = inverse_adjust_rating(task_result["rating"], task_result["prev_contests"])
-    time_model_sample_users = [task_result for task_result in recurring_users
-                   if task_result[task_screen_name + ".time"] > first_ac / 2 and task_result[
-                       task_screen_name + ".ac"] == 1.]
+    time_model_sample_users = []
+    for task_result in recurring_users:
+        if task_result[task_screen_name + ".ac"] == 1.:
+            if task_result[task_screen_name + ".time"] > first_ac / 2:
+                time_model_sample_users.append(task_result)
+        else:
+            pass
+            # time_model_sample_users.append(task_result)
+
     model = {}
     if len(time_model_sample_users) < 40:
         print(
@@ -160,7 +168,7 @@ def fit_problem_model(user_results, task_screen_name):
     return model
 
 
-def fetch_dataset_for_contest(contest_name, existing_problem):
+def fetch_dataset_for_contest(contest_name, existing_problem, duration_second):
     try:
         results = requests.get(
             "https://atcoder.jp/contests/{}/standings/json".format(contest_name)).json()
@@ -191,13 +199,14 @@ def fetch_dataset_for_contest(contest_name, existing_problem):
             "prev_contests": prev_contests,
             "user_name": user_name
         }
+        prev_accepted_times = [0] + [task_result["Elapsed"]
+                                     for task_result in result_row["TaskResults"].values() if task_result["Score"] > 0]
+        default_elapsed = duration_second * (10 ** 9) - max(prev_accepted_times)
         for task_name in task_names:
             user_row[task_name + ".score"] = 0.
             user_row[task_name + ".time"] = -1.
-            user_row[task_name + ".elapsed"] = 10 ** 200
+            user_row[task_name + ".elapsed"] = default_elapsed
 
-        prev_accepted_times = [0] + [task_result["Elapsed"]
-                                     for task_result in result_row["TaskResults"].values() if task_result["Score"] > 0]
         user_row["last_ac"] = max(prev_accepted_times)
         for task_screen_name, task_result in result_row["TaskResults"].items():
             user_row[task_screen_name + ".score"] = task_result["Score"]
@@ -206,7 +215,7 @@ def fetch_dataset_for_contest(contest_name, existing_problem):
                 penalty = task_result["Penalty"] * 5 * 60 * (10 ** 9)
                 user_row[task_screen_name + ".elapsed"] = elapsed
                 user_row[task_screen_name + ".time"] = penalty + elapsed - \
-                    max(t for t in prev_accepted_times if t < elapsed)
+                                                       max(t for t in prev_accepted_times if t < elapsed)
         user_results.append(user_row)
 
     if len(user_results) == 0:
@@ -255,16 +264,18 @@ def all_rated_contests():
     contests = requests.get(
         "https://kenkoooo.com/atcoder/resources/contests.json").json()
     contests.sort(key=lambda contest: contest["start_epoch_second"])
-    contests_and_types = [(contest["id"], infer_contest_type(contest)) for contest in contests]
-    return [(contest_id, contest_type) for contest_id, contest_type in contests_and_types if contest_type != ContestType.UNRATED]
+    contests_and_types = [(contest, infer_contest_type(contest)) for contest in contests]
+    return [(contest, contest_type) for contest, contest_type in contests_and_types if
+            contest_type != ContestType.UNRATED]
 
 
 def run(target, overwrite):
     recompute_history = target is None and overwrite
+    rated_contests = all_rated_contests()
     if target is None:
-        target = all_rated_contests()
+        target = rated_contests
     else:
-        target = [(target_id, None) for target_id in target]
+        target = [(contest, contest_type) for contest, contest_type in rated_contests if contest["id"] in target]
     current_models = get_current_models()
     existing_problems = current_models.keys() if not overwrite else set()
 
@@ -274,8 +285,10 @@ def run(target, overwrite):
     competition_history_by_id = defaultdict(set)
     experimental_problems = set()
     for contest, contest_type in target:
+        contest_id = contest["id"]
+        duration_second = contest["duration_second"]
         is_old_contest = not contest_type.is_rated
-        user_results_by_problem, standings = fetch_dataset_for_contest(contest, existing_problems)
+        user_results_by_problem, standings = fetch_dataset_for_contest(contest_id, existing_problems, duration_second)
         for problem, data_points in user_results_by_problem.items():
             if recompute_history:
                 # overwrite competition history, and rating if necessary
@@ -285,16 +298,17 @@ def run(target, overwrite):
                     for data_point in data_points:
                         prev_contests = rating_system.competition_count(data_point["user_name"])
                         data_point["prev_contests"] = prev_contests
-                        data_point["rating"] = rating_system.calc_rating(data_point["user_name"]) if prev_contests > 0 else 0
+                        data_point["rating"] = rating_system.calc_rating(
+                            data_point["user_name"]) if prev_contests > 0 else 0
                 else:
                     # contests after official rating system. using the official rating
                     for data_point in data_points:
-                        competition_history_by_id[data_point["user_name"]].add(contest)
+                        competition_history_by_id[data_point["user_name"]].add(contest_id)
                     for data_point in data_points:
                         data_point["prev_contests"] = len(competition_history_by_id[data_point["user_name"]]) - 1
             dataset_by_problem[problem] += data_points
         if recompute_history and is_old_contest:
-            print("Updating user rating with the result of {}".format(contest))
+            print("Updating user rating with the result of {}".format(contest_id))
             rating_system.update(standings, contest_type)
     print(f"Estimating time models of {len(target)} contests.")
     results = current_models
