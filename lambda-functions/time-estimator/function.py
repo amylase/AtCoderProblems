@@ -1,65 +1,38 @@
 import json
 import math
 import random
+import statistics
 from collections import defaultdict
-from datetime import datetime
 
 import boto3
 import requests
 
 from rating import RatingSystem, ContestType
-
-
-def single_regression(x, y):
-    n = len(x)
-    x_sum = sum(x)
-    y_sum = sum(y)
-    xy_sum = sum(x * y for x, y in zip(x, y))
-    sqx_sum = sum(x ** 2 for x in x)
-    slope = (n * xy_sum - x_sum * y_sum) / (n * sqx_sum - x_sum ** 2)
-    intercept = (sqx_sum * y_sum - xy_sum * x_sum) / (n * sqx_sum - x_sum ** 2)
-    return slope, intercept
-
-
-def safe_log(x):
-    return math.log(max(x, 10 ** -100))
-
-
-def safe_sigmoid(x):
-    return 1. / (1. + math.exp(min(x, 750)))
+from stats import single_regression, safe_log, safe_sigmoid, minimize, normal_pdf, normal_cdf
 
 
 def fit_2plm_irt(xs, ys):
-    random.seed(20191019)
+    def f(sample, args):
+        x, y = sample
+        a, b = args
+        p = safe_sigmoid(a * x + b)
+        return -safe_log(p if y == 1. else (1 - p))
 
-    iter_n = max(100000 // len(xs), 1)
+    def grad_f(sample, args):
+        x, y = sample
+        a, b = args
+        p = safe_sigmoid(a * x + b)
+        grad_a = x * (p - y)
+        grad_b = (p - y)
+        return [-grad_a, -grad_b]
 
-    eta = 1.
     x_scale = 1000.
-
     scxs = [x / x_scale for x in xs]
     samples = list(zip(scxs, ys))
 
-    a, b = 0., 0.
-    r_a, r_b = 1., 1.
-    iterations = []
-    for iteration in range(iter_n):
-        logl = 0.
-        for x, y in samples:
-            p = safe_sigmoid(a * x + b)
-            logl += safe_log(p if y == 1. else (1 - p))
-        iterations.append((logl, a, b))
+    best_args, _ = minimize([0., 0.], samples, f, grad_f, 100000, 1., 20191019)
+    a, b = best_args
 
-        random.shuffle(samples)
-        for x, y in samples:
-            p = safe_sigmoid(a * x + b)
-            grad_a = x * (p - y)
-            grad_b = (p - y)
-            r_a += grad_a ** 2
-            r_b += grad_b ** 2
-            a += eta * grad_a / r_a ** 0.5
-            b += eta * grad_b / r_b ** 0.5
-    best_logl, a, b = max(iterations)
     a /= x_scale
     return -b / a, -a
 
@@ -91,6 +64,60 @@ def is_very_easy_problem(task_screen_name):
         task_screen_name[3:6]) >= 42
 
 
+def fit_time_model(raw_ratings, time_log_secs, acs):
+    ac_ratings, ac_time_logs = [], []
+    wa_ratings, wa_time_logs = [], []
+    for i in range(len(acs)):
+        if acs[i] == 1.:
+            ac_ratings.append(raw_ratings[i])
+            ac_time_logs.append(time_log_secs[i])
+        else:
+            wa_ratings.append(raw_ratings[i])
+            wa_time_logs.append(time_log_secs[i])
+    n_ac, n_wa = len(ac_ratings), len(wa_ratings)
+
+    slope, intercept = single_regression(ac_ratings, ac_time_logs)
+    variance = statistics.variance([slope * ac_ratings[i] + intercept - ac_time_logs[i] for i in range(n_ac)])
+
+    def f(sample, args):
+        x, y, t = sample
+        a, b, vl = args
+        v = math.exp(vl)
+        sd = math.sqrt(v)
+        pred_y = a * x + b
+        if t == 1.:
+            # ac
+            return -safe_log(normal_pdf(y - pred_y, 0., sd))
+        else:
+            # wa
+            return -safe_log(1. - normal_cdf(y, pred_y, sd))
+
+    def grad_f(sample, args):
+        grads = []
+        delta = 1e-8
+        for i in range(len(args)):
+            new_args = list(args)
+            new_args[i] = args[i] + delta
+            l = f(sample, new_args)
+            new_args[i] = args[i] - delta
+            r = f(sample, new_args)
+            grads.append((l - r) / (2 * delta))
+        return grads
+
+    rating_scale = 1000.
+    scaled_ratings = [r / rating_scale for r in raw_ratings]
+    samples = list(zip(scaled_ratings, time_log_secs, acs))
+
+    # parameter transform
+    # slope -> slope * rating_scale: to improve gradient descent based optimization
+    # variance -> log(variance): to eliminate variance > 0 constraint (minimize() does not support constraints)
+    best_args, _ = minimize([slope * rating_scale, intercept, math.log(variance)], samples, f, grad_f, 20000, 0.001, 20191019)
+    scaled_slope, best_intercept, log_variance = best_args
+    best_slope = scaled_slope / rating_scale
+    best_variance = math.exp(log_variance)
+    return best_slope, best_intercept, best_variance
+
+
 def fit_problem_model(user_results, task_screen_name):
     max_score = max(task_result[task_screen_name + ".score"] for task_result in user_results)
     if max_score == 0.:
@@ -112,20 +139,23 @@ def fit_problem_model(user_results, task_screen_name):
             if task_result[task_screen_name + ".time"] > first_ac / 2:
                 time_model_sample_users.append(task_result)
         else:
-            pass
-            # time_model_sample_users.append(task_result)
+            time_model_sample_users.append(task_result)
 
     model = {}
     if len(time_model_sample_users) < 40:
         print(
             f"{task_screen_name}: insufficient data ({len(time_model_sample_users)} users). skip estimating time model.")
+    elif sum(task_result[task_screen_name + ".ac"] for task_result in time_model_sample_users) < 5:
+        print(
+            f"{task_screen_name}: insufficient accepted data. skip estimating time model.")
     else:
         raw_ratings = [task_result["raw_rating"]
                        for task_result in time_model_sample_users]
         time_secs = [task_result[task_screen_name + ".time"] /
                      (10 ** 9) for task_result in time_model_sample_users]
         time_logs = [math.log(t) for t in time_secs]
-        slope, intercept = single_regression(raw_ratings, time_logs)
+        acs = [task_result[task_screen_name + ".ac"] for task_result in time_model_sample_users]
+        slope, intercept, variance = fit_time_model(raw_ratings, time_logs, acs)
         print(
             f"{task_screen_name}: time [sec] = exp({slope} * raw_rating + {intercept})")
         if slope > 0:
@@ -133,6 +163,7 @@ def fit_problem_model(user_results, task_screen_name):
         else:
             model["slope"] = slope
             model["intercept"] = intercept
+            model["variance"] = variance
 
     if is_very_easy_problem(task_screen_name):
         # ad-hoc. excluding high-rating competitors from abc-a/abc-b dataset. They often skip these problems.
@@ -201,11 +232,11 @@ def fetch_dataset_for_contest(contest_name, existing_problem, duration_second):
         }
         prev_accepted_times = [0] + [task_result["Elapsed"]
                                      for task_result in result_row["TaskResults"].values() if task_result["Score"] > 0]
-        default_elapsed = duration_second * (10 ** 9) - max(prev_accepted_times)
+        default_time = duration_second * (10 ** 9) - max(prev_accepted_times)
         for task_name in task_names:
             user_row[task_name + ".score"] = 0.
-            user_row[task_name + ".time"] = -1.
-            user_row[task_name + ".elapsed"] = default_elapsed
+            user_row[task_name + ".time"] = default_time
+            user_row[task_name + ".elapsed"] = duration_second * (10 ** 9)
 
         user_row["last_ac"] = max(prev_accepted_times)
         for task_screen_name, task_result in result_row["TaskResults"].items():
